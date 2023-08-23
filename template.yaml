@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform:
+  - AWS::LanguageExtensions
+  - AWS::Serverless-2016-10-31
+
+Parameters:
+  TargetEnvironment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+  LambdaTimeout:
+    Type: Number
+    Description: timeout for the lambda functions
+    Default: 900
+
+Globals:
+  Function:
+    CodeUri: ./
+    Runtime: nodejs18.x
+    MemorySize: 3008
+    Timeout: !Ref LambdaTimeout
+    Environment:
+      Variables:
+        WEBSOCKET_CONNECTIONS_TABLE: !Ref connectionsTable
+        WSS_API_ENDPOINT: !GetAtt WebSocketAPI.ApiEndpoint
+        HTTPS_API_ENDPOINT: !Sub 'https://${WebSocketAPI}.execute-api.${AWS::Region}.${AWS::URLSuffix}/$default/'
+  
+Resources:
+  ApiIntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-ApiIntegrationRole"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "events:PutTargets"
+                  - "events:DescribeRule"
+                  - "events:PutRule"
+                Resource: "*"
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt connectionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketAPI}/*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  
+#######################
+#### API RESOURCES ####
+#######################
+  
+  WebSocketAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Ref AWS::StackName
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+      ApiKeySelectionExpression: $request.header.x-api-key
+  
+  WebSocketAPIDefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties: 
+      ApiId: !Ref WebSocketAPI
+      StageName: $default
+      AutoDeploy: true
+  
+  WebSocketAPIDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      StageName: !Ref WebSocketAPIDefaultStage
+    DependsOn:
+      - connectRoute
+      - disconnectRoute
+      - defaultRoute
+      - createUserRoute
+  
+#######################
+#### CONNECT ROUTE ####
+#######################
+  
+  connectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      OperationName: !Sub "${AWS::StackName}-connectRoute"
+      ApiId: !Ref WebSocketAPI
+      AuthorizationType: NONE
+      RouteKey: $connect
+      Target: !Sub "integrations/${connectIntegration}"
+  
+  connectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      CredentialsArn: !GetAtt ApiIntegrationRole.Arn
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Join
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':apigateway:'
+          - !Ref 'AWS::Region'
+          - ':lambda:path/2015-03-31/functions/'
+          - !GetAtt connectFunction.Arn
+          - /invocations
+  
+  connectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-connectFunction"
+      Role: !GetAtt ApiIntegrationRole.Arn
+      Handler: src/routes/connect.handler
+  
+  connectFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref connectFunction ]]
+  
+  connectFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref connectFunction
+      Principal: apigateway.amazonaws.com
+  
+##########################
+#### DISCONNECT ROUTE ####
+##########################
+  
+  disconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      OperationName: !Sub "${AWS::StackName}-disconnectRoute"
+      ApiId: !Ref WebSocketAPI
+      AuthorizationType: NONE
+      RouteKey: $disconnect
+      Target: !Sub "integrations/${disconnectIntegration}"
+  
+  disconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      CredentialsArn: !GetAtt ApiIntegrationRole.Arn
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Join
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':apigateway:'
+          - !Ref 'AWS::Region'
+          - ':lambda:path/2015-03-31/functions/'
+          - !GetAtt disconnectFunction.Arn
+          - /invocations
+  
+  disconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-disconnectFunction"
+      Role: !GetAtt ApiIntegrationRole.Arn
+      Handler: src/routes/disconnect.handler
+  
+  disconnectFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref disconnectFunction ]]
+  
+  disconnectFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref disconnectFunction
+      Principal: apigateway.amazonaws.com
+  
+#######################
+#### DEFAULT ROUTE ####
+#######################
+  
+  defaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      OperationName: !Sub "${AWS::StackName}-defaultRoute"
+      ApiId: !Ref WebSocketAPI
+      AuthorizationType: NONE
+      RouteKey: $default
+      Target: !Sub "integrations/${defaultIntegration}"
+  
+  defaultRouteResponse:
+    Type: AWS::ApiGatewayV2::RouteResponse
+    Properties:
+      RouteId: !Ref defaultRoute
+      ApiId: !Ref WebSocketAPI
+      RouteResponseKey: $default
+  
+  defaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      CredentialsArn: !GetAtt ApiIntegrationRole.Arn
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Join
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':apigateway:'
+          - !Ref 'AWS::Region'
+          - ':lambda:path/2015-03-31/functions/'
+          - !GetAtt defaultFunction.Arn
+          - /invocations
+  
+  defaultFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-defaultFunction"
+      Role: !GetAtt ApiIntegrationRole.Arn
+      Handler: src/routes/default.handler
+  
+  defaultFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref defaultFunction ]]
+  
+  defaultFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref defaultFunction
+      Principal: apigateway.amazonaws.com
+  
+###########################
+#### CREATE USER ROUTE ####
+###########################
+  
+  createUserRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      OperationName: !Sub "${AWS::StackName}-createUserRoute"
+      ApiId: !Ref WebSocketAPI
+      AuthorizationType: NONE
+      RouteKey: createuser
+      Target: !Sub "integrations/${createUserIntegration}"
+  
+  createUserRouteResponse:
+    Type: AWS::ApiGatewayV2::RouteResponse
+    Properties:
+      RouteId: !Ref createUserRoute
+      ApiId: !Ref WebSocketAPI
+      RouteResponseKey: $default
+  
+  createUserIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      CredentialsArn: !GetAtt ApiIntegrationRole.Arn
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Join
+        - ''
+        - - 'arn:'
+          - !Ref 'AWS::Partition'
+          - ':apigateway:'
+          - !Ref 'AWS::Region'
+          - ':lambda:path/2015-03-31/functions/'
+          - !GetAtt createUserFunction.Arn
+          - /invocations
+  
+  createUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-createUserFunction"
+      Role: !GetAtt ApiIntegrationRole.Arn
+      Handler: src/routes/createUser.handler
+  
+  createUserFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/aws/lambda/, !Ref createUserFunction ]]
+  
+  createUserFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref createUserFunction
+      Principal: apigateway.amazonaws.com
+  
+##################################
+#### ACTIVE CONNECTIONS TABLE ####
+##################################
+  
+  connectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      TableName: !Sub "${AWS::StackName}-active-connections"
+      BillingMode: PROVISIONED
+      TableClass: STANDARD
+      AttributeDefinitions:
+        - AttributeName: "connectionId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "connectionId"
+          KeyType: "HASH"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+  
+##################################
+#### ACTIVE CONNECTIONS TABLE ####
+##################################
+  
+  connectionUpdater:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-connectionUpdater"
+      Role: !GetAtt ApiIntegrationRole.Arn
+      Handler: src/connectionUpdater.handler
+  
+  connectionUpdaterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/lambda/', !Ref connectionUpdater]]
+  
+  connectionUpdaterEBRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-connectionUpdater-EBRule"
+      ScheduleExpression: cron(0/5 * * * ? *) # every 5 minutes
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt connectionUpdater.Arn
+          Id: !Sub "${AWS::StackName}-connectionUpdater-Id"
+  
+  connectionUpdaterEBPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt connectionUpdater.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt connectionUpdaterEBRule.Arn
+  
+Outputs:
+  WebSocketAPIendpoint:
+    Value: !Sub '${WebSocketAPI.ApiEndpoint}/$default'
+  HttpsWebSocketAPIendpoint:
+    Value: !Sub 'https://${WebSocketAPI}.execute-api.${AWS::Region}.${AWS::URLSuffix}/$default'
+
